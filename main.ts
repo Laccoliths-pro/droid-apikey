@@ -779,7 +779,7 @@ async function fetchApiKeyData(id: string, key: string, retryCount = 0): Promise
       const errorBody = await response.text();
       
       // Retry on 429 (rate limit) or 503 (service unavailable)
-      if ((response.status === 429 || response.status === 401) && retryCount < maxRetries) {
+      if ((response.status === 429 || response.status === 503) && retryCount < maxRetries) {
         const delayMs = (retryCount + 1) * 1000; // 1s, 2s
         console.log(`Rate limited for key ${id}, retrying in ${delayMs}ms... (attempt ${retryCount + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -837,7 +837,17 @@ async function getAggregatedData(): Promise<AggregatedResponse> {
   const keyPairs = await getAllKeys();
 
   if (keyPairs.length === 0) {
-    throw new Error("数据库中没有找到 API Key。请通过管理界面添加 Key。");
+    const beijingTime = getBeijingTime();
+    return {
+      update_time: format(beijingTime, "yyyy-MM-dd HH:mm:ss"),
+      total_count: 0,
+      totals: {
+        total_orgTotalTokensUsed: 0,
+        total_totalAllowance: 0,
+        totalRemaining: 0,
+      },
+      data: [],
+    };
   }
 
   // Fetch API key data with concurrency control (10 at a time, 100ms delay between batches)
