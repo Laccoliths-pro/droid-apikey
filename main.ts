@@ -78,29 +78,23 @@ class ServerState {
   private lastError: string | null = null;
   private isUpdating = false;
 
-  getData(): AggregatedResponse | null {
-    return this.cachedData;
-  }
-
-  getError(): string | null {
-    return this.lastError;
-  }
-
-  setUpdating(status: boolean) {
-    this.isUpdating = status;
-  }
-
-  isCurrentlyUpdating(): boolean {
-    return this.isUpdating;
-  }
+  getData = () => this.cachedData;
+  getError = () => this.lastError;
+  isCurrentlyUpdating = () => this.isUpdating;
   
   updateCache(data: AggregatedResponse) {
     this.cachedData = data;
-    this.lastError = null; // Clear previous errors on successful update
+    this.lastError = null;
+    this.isUpdating = false;
   }
 
   setError(errorMessage: string) {
     this.lastError = errorMessage;
+    this.isUpdating = false;
+  }
+  
+  startUpdate() {
+    this.isUpdating = true;
   }
 }
 
@@ -133,16 +127,9 @@ async function deleteKey(id: string): Promise<void> {
   await kv.delete(["api_keys", id]);
 }
 
-// 检查API key是否已存在（基于key值而非id）
 async function apiKeyExists(key: string): Promise<boolean> {
   const keys = await getAllKeys();
   return keys.some(k => k.key === key);
-}
-
-// 检查ID是否存在（用于删除操作）
-async function keyExists(id: string): Promise<boolean> {
-  const result = await kv.get(["api_keys", id]);
-  return result.value !== null;
 }
 
 // ==================== Utility Functions ====================
@@ -333,20 +320,8 @@ const HTML_CONTENT = `
         // Global variable to store current API data
         let currentApiData = null;
 
-        function formatNumber(num) {
-            if (num === undefined || num === null) {
-                return '0';
-            }
-            return new Intl.NumberFormat('en-US').format(num);
-        }
-
-
-        function formatPercentage(ratio) {
-            if (ratio === undefined || ratio === null) {
-                return '0.00%';
-            }
-            return (ratio * 100).toFixed(2) + '%';
-        }  
+        const formatNumber = (num) => num ? new Intl.NumberFormat('en-US').format(num) : '0';
+        const formatPercentage = (ratio) => ratio ? (ratio * 100).toFixed(2) + '%' : '0.00%';  
   
   
         function loadData(retryCount = 0) {  
@@ -435,6 +410,7 @@ const HTML_CONTENT = `
                             <td class="key-cell" title="\${item.key}">\${item.key}</td>
                             <td colspan="5" class="error-row">加载失败: \${item.error}</td>
                             <td style="text-align: center;">
+                                <button class="btn btn-primary" onclick="refreshSingleKey('\${item.id}')" style="padding: 6px 12px; font-size: 12px; margin-right: 5px;">刷新</button>
                                 <button class="btn btn-danger" onclick="deleteKeyFromTable('\${item.id}')" style="padding: 6px 12px; font-size: 12px;">删除</button>
                             </td>
                         </tr>\`;
@@ -442,7 +418,7 @@ const HTML_CONTENT = `
                     // MODIFICATION: Calculate remaining here, ensuring it's not negative.
                     const remaining = Math.max(0, item.totalAllowance - item.orgTotalTokensUsed);
                     tableHTML += \`
-                        <tr>
+                        <tr id="key-row-\${item.id}">
                             <td class="key-cell" title="\${item.key}">\${item.key}</td>
                             <td>\${item.startDate}</td>
                             <td>\${item.endDate}</td>
@@ -451,6 +427,7 @@ const HTML_CONTENT = `
                             <td class="number">\${formatNumber(remaining)}</td>
                             <td class="number">\${formatPercentage(item.usedRatio)}</td>
                             <td style="text-align: center;">
+                                <button class="btn btn-primary" onclick="refreshSingleKey('\${item.id}')" style="padding: 6px 12px; font-size: 12px; margin-right: 5px;">刷新</button>
                                 <button class="btn btn-danger" onclick="deleteKeyFromTable('\${item.id}')" style="padding: 6px 12px; font-size: 12px;">删除</button>
                             </td>
                         </tr>\`;
@@ -492,9 +469,7 @@ const HTML_CONTENT = `
 
         async function exportKeys() {
             const password = prompt('请输入导出密码：');
-            if (!password) {
-                return;
-            }
+            if (!password) return;
 
             const exportBtn = document.getElementById('exportKeysBtn');
             exportBtn.disabled = true;
@@ -510,13 +485,13 @@ const HTML_CONTENT = `
                 const result = await response.json();
 
                 if (response.ok) {
-                    // Create a text file with the keys (only key values, one per line)
                     const keysText = result.keys.map(k => k.key).join('\\n');
                     const blob = new Blob([keysText], { type: 'text/plain' });
                     const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = \`api_keys_export_\${new Date().toISOString().split('T')[0]}.txt\`;
+                    const a = Object.assign(document.createElement('a'), {
+                        href: url,
+                        download: \`api_keys_export_\${new Date().toISOString().split('T')[0]}.txt\`
+                    });
                     document.body.appendChild(a);
                     a.click();
                     document.body.removeChild(a);
@@ -534,30 +509,16 @@ const HTML_CONTENT = `
         }
 
         async function deleteAllKeys() {
-            if (!currentApiData) {
-                alert('请先加载数据');
-                return;
-            }
+            if (!currentApiData) return alert('请先加载数据');
 
             const totalKeys = currentApiData.total_count;
-
-            if (totalKeys === 0) {
-                alert('没有可删除的Key');
-                return;
-            }
+            if (totalKeys === 0) return alert('没有可删除的Key');
 
             const confirmMsg = \`⚠️ 危险操作！\\n\\n确定要删除所有 \${totalKeys} 个Key吗？\\n此操作不可恢复！\`;
+            if (!confirm(confirmMsg)) return;
 
-            if (!confirm(confirmMsg)) {
-                return;
-            }
-
-            // 二次确认
             const secondConfirm = prompt('请输入 "确认删除" 以继续：');
-            if (secondConfirm !== '确认删除') {
-                alert('操作已取消');
-                return;
-            }
+            if (secondConfirm !== '确认删除') return alert('操作已取消');
 
             const deleteBtn = document.getElementById('deleteAllBtn');
             deleteBtn.disabled = true;
@@ -588,22 +549,15 @@ const HTML_CONTENT = `
         }
 
         async function deleteZeroBalanceKeys() {
-            if (!currentApiData) {
-                alert('请先加载数据');
-                return;
-            }
+            if (!currentApiData) return alert('请先加载数据');
 
-            // Find all keys with zero remaining balance
             const zeroBalanceKeys = currentApiData.data.filter(item => {
-                if (item.error) return false; // Skip error items
+                if (item.error) return false;
                 const remaining = Math.max(0, (item.totalAllowance || 0) - (item.orgTotalTokensUsed || 0));
                 return remaining === 0;
             });
 
-            if (zeroBalanceKeys.length === 0) {
-                alert('没有找到余额为0的Key');
-                return;
-            }
+            if (zeroBalanceKeys.length === 0) return alert('没有找到余额为0的Key');
 
             const confirmMsg = \`确定要删除 \${zeroBalanceKeys.length} 个余额为0的Key吗？\\n\\n将删除以下Key ID:\\n\${zeroBalanceKeys.map(k => k.id).join('\\n')}\`;
 
@@ -642,26 +596,18 @@ const HTML_CONTENT = `
             event.preventDefault();
             const input = document.getElementById('batchKeysInput').value.trim();
 
-            if (!input) {
-                showMessage('请输入要导入的 Keys', true);
-                return;
-            }
+            if (!input) return showMessage('请输入要导入的 Keys', true);
 
             const lines = input.split('\\n').map(line => line.trim()).filter(line => line.length > 0);
             const keysToImport = [];
-            // Use timestamp + random to generate unique IDs
             const timestamp = Date.now();
             let autoIdCounter = 1;
 
             for (const line of lines) {
                 if (line.includes(':')) {
-                    // Format: ID:KEY
                     const [id, key] = line.split(':').map(s => s.trim());
-                    if (id && key) {
-                        keysToImport.push({ id, key });
-                    }
+                    if (id && key) keysToImport.push({ id, key });
                 } else {
-                    // Pure key, auto-generate unique ID using timestamp
                     const randomSuffix = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
                     keysToImport.push({
                         id: \`key-\${timestamp}-\${autoIdCounter++}-\${randomSuffix}\`,
@@ -670,10 +616,7 @@ const HTML_CONTENT = `
                 }
             }
 
-            if (keysToImport.length === 0) {
-                showMessage('没有有效的 Key 可以导入', true);
-                return;
-            }
+            if (keysToImport.length === 0) return showMessage('没有有效的 Key 可以导入', true);
 
             try {
                 const response = await fetch('/api/keys', {
@@ -698,20 +641,15 @@ const HTML_CONTENT = `
         }
 
         async function deleteKeyFromTable(id) {
-            if (!confirm(\`确定要删除 Key "\${id}" 吗？\`)) {
-                return;
-            }
+            if (!confirm(\`确定要删除 Key "\${id}" 吗？\`)) return;
 
             try {
-                const response = await fetch(\`/api/keys/\${id}\`, {
-                    method: 'DELETE'
-                });
-
+                const response = await fetch(\`/api/keys/\${id}\`, { method: 'DELETE' });
                 const result = await response.json();
 
                 if (response.ok) {
                     alert(\`Key "\${id}" 已删除成功\`);
-                    loadData(); // Refresh main data
+                    loadData();
                 } else {
                     alert('删除失败: ' + (result.error || '未知错误'));
                 }
@@ -720,12 +658,59 @@ const HTML_CONTENT = `
             }
         }
 
-        // Close modal when clicking outside
-        document.addEventListener('click', function(event) {
-            const modal = document.getElementById('manageModal');
-            if (event.target === modal) {
-                closeManageModal();
+        async function refreshSingleKey(id) {
+            const row = document.getElementById(\`key-row-\${id}\`);
+            if (!row) return alert('找不到对应的行');
+
+            const cells = row.querySelectorAll('td');
+            const originalContent = [];
+            cells.forEach((cell, index) => {
+                originalContent[index] = cell.innerHTML;
+                if (index > 0 && index < cells.length - 1) {
+                    cell.innerHTML = '<span style="color: #6c757d;">⏳ 刷新中...</span>';
+                }
+            });
+
+            try {
+                const response = await fetch(\`/api/keys/\${id}/refresh\`, {
+                    method: 'POST'
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.data) {
+                    const item = result.data;
+                    
+                    if (item.error) {
+                        cells[1].innerHTML = '<span class="error-row">加载失败: ' + item.error + '</span>';
+                        cells[2].colSpan = 5;
+                        for (let i = 3; i < cells.length - 1; i++) cells[i].style.display = 'none';
+                    } else {
+                        const remaining = Math.max(0, item.totalAllowance - item.orgTotalTokensUsed);
+                        [cells[1].innerHTML, cells[2].innerHTML, cells[3].innerHTML, 
+                         cells[4].innerHTML, cells[5].innerHTML, cells[6].innerHTML] = 
+                        [item.startDate, item.endDate, formatNumber(item.totalAllowance),
+                         formatNumber(item.orgTotalTokensUsed), formatNumber(remaining), formatPercentage(item.usedRatio)];
+                        
+                        for (let i = 1; i < cells.length - 1; i++) {
+                            cells[i].style.display = '';
+                            cells[i].colSpan = 1;
+                        }
+                    }
+                    loadData();
+                } else {
+                    alert('刷新失败: ' + (result.error || '未知错误'));
+                    cells.forEach((cell, index) => cell.innerHTML = originalContent[index]);
+                }
+            } catch (error) {
+                alert('网络错误: ' + error.message);
+                cells.forEach((cell, index) => cell.innerHTML = originalContent[index]);
             }
+        }
+
+        document.addEventListener('click', (event) => {
+            const modal = document.getElementById('manageModal');
+            if (event.target === modal) closeManageModal();
         });
     </script>
 </body>
@@ -776,29 +761,22 @@ async function fetchApiKeyData(id: string, key: string, retryCount = 0): Promise
     });
 
     if (!response.ok) {
-      const errorBody = await response.text();
-      
       if (response.status === 401 && retryCount < maxRetries) {
-        const delayMs = (retryCount + 1) * 1000; // 1s, 2s
-        console.log(`Rate limited for key ${id}, retrying in ${delayMs}ms... (attempt ${retryCount + 1}/${maxRetries})`);
+        const delayMs = (retryCount + 1) * 1000;
         await new Promise(resolve => setTimeout(resolve, delayMs));
         return fetchApiKeyData(id, key, retryCount + 1);
       }
-      
-      console.error(`Error fetching data for key ID ${id}: ${response.status} ${errorBody}`);
       return { id, key: maskedKey, error: `HTTP ${response.status}` };
     }
 
     const apiData: ApiResponse = await response.json();
-
-    // Validate response structure
-    if (!apiData.usage || !apiData.usage.standard) {
-      return { id, key: maskedKey, error: 'Invalid API response structure' };
+    const { usage } = apiData;
+    
+    if (!usage?.standard) {
+      return { id, key: maskedKey, error: 'Invalid API response' };
     }
 
-    const { usage } = apiData;
     const { standard } = usage;
-
     return {
       id,
       key: maskedKey,
@@ -809,8 +787,6 @@ async function fetchApiKeyData(id: string, key: string, retryCount = 0): Promise
       usedRatio: standard.usedRatio || 0,
     };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error(`Failed to process key ID ${id}:`, errorMessage);
     return { id, key: maskedKey, error: 'Failed to fetch' };
   }
 }  
@@ -818,13 +794,7 @@ async function fetchApiKeyData(id: string, key: string, retryCount = 0): Promise
   
 // ==================== Type Guards ====================
 
-function isApiUsageData(result: ApiKeyResult): result is ApiUsageData {
-  return !('error' in result);
-}
-
-function isApiErrorData(result: ApiKeyResult): result is ApiErrorData {
-  return 'error' in result;
-}
+const isApiUsageData = (result: ApiKeyResult): result is ApiUsageData => !('error' in result);
 
 // ==================== Data Aggregation ====================
 
@@ -832,75 +802,43 @@ function isApiErrorData(result: ApiKeyResult): result is ApiErrorData {
  * Aggregates data from all configured API keys.
  */
 async function getAggregatedData(): Promise<AggregatedResponse> {
-  // Get keys from KV database
   const keyPairs = await getAllKeys();
+  const beijingTime = getBeijingTime();
+  const emptyResponse = {
+    update_time: format(beijingTime, "yyyy-MM-dd HH:mm:ss"),
+    total_count: 0,
+    totals: { total_orgTotalTokensUsed: 0, total_totalAllowance: 0, totalRemaining: 0 },
+    data: [],
+  };
 
-  if (keyPairs.length === 0) {
-    const beijingTime = getBeijingTime();
-    return {
-      update_time: format(beijingTime, "yyyy-MM-dd HH:mm:ss"),
-      total_count: 0,
-      totals: {
-        total_orgTotalTokensUsed: 0,
-        total_totalAllowance: 0,
-        totalRemaining: 0,
-      },
-      data: [],
-    };
-  }
+  if (keyPairs.length === 0) return emptyResponse;
 
-  // Fetch API key data with concurrency control (10 at a time, 100ms delay between batches)
-  console.log(`Fetching data for ${keyPairs.length} API keys with rate limiting...`);
   const results = await batchProcess(
     keyPairs,
     ({ id, key }) => fetchApiKeyData(id, key),
-    10, // Process 10 keys concurrently
-    100 // 100ms delay between batches
+    10,
+    100
   );
 
-  // Filter valid results (non-error)
   const validResults = results.filter(isApiUsageData);
+  const sortedValid = validResults
+    .map(r => ({ ...r, remaining: Math.max(0, r.totalAllowance - r.orgTotalTokensUsed) }))
+    .sort((a, b) => b.remaining - a.remaining)
+    .map(({ remaining, ...rest }) => rest);
 
-  // Calculate remaining for each valid result
-  const resultsWithRemaining = validResults.map(result => ({
-    ...result,
-    remaining: Math.max(0, result.totalAllowance - result.orgTotalTokensUsed)
-  }));
+  const totals = validResults.reduce((acc, res) => ({
+    total_orgTotalTokensUsed: acc.total_orgTotalTokensUsed + res.orgTotalTokensUsed,
+    total_totalAllowance: acc.total_totalAllowance + res.totalAllowance,
+    totalRemaining: acc.totalRemaining + Math.max(0, res.totalAllowance - res.orgTotalTokensUsed)
+  }), emptyResponse.totals);
 
-  // Sort by remaining balance in descending order (from highest to lowest)
-  resultsWithRemaining.sort((a, b) => b.remaining - a.remaining);
-
-  // Create the final results array with sorted valid results and error results
-  const sortedValidResults = resultsWithRemaining.map(({ remaining, ...rest }) => rest);
-  const errorResults = results.filter(isApiErrorData);
-  const finalResults = [...sortedValidResults, ...errorResults];
-
-  // Calculate totals, ensuring totalRemaining is not negative
-  const totals = validResults.reduce((acc, res) => {
-    acc.total_orgTotalTokensUsed += res.orgTotalTokensUsed;
-    acc.total_totalAllowance += res.totalAllowance;
-
-    // Calculate remaining for each key and add it to the total
-    const remaining = res.totalAllowance - res.orgTotalTokensUsed;
-    acc.totalRemaining += Math.max(0, remaining);
-
-    return acc;
-  }, {
-    total_orgTotalTokensUsed: 0,
-    total_totalAllowance: 0,
-    totalRemaining: 0,
-  });
-
-  // Log keys with remaining balance
   logKeysWithBalance(validResults, keyPairs);
-
-  const beijingTime = getBeijingTime();
 
   return {
     update_time: format(beijingTime, "yyyy-MM-dd HH:mm:ss"),
     total_count: keyPairs.length,
     totals,
-    data: finalResults,
+    data: [...sortedValid, ...results.filter(r => 'error' in r)],
   };
 }
 
@@ -938,24 +876,18 @@ function logKeysWithBalance(validResults: ApiUsageData[], keyPairs: ApiKey[]): v
  * Periodically fetches data and updates the server state cache.
  */
 async function autoRefreshData() {
-  if (serverState.isCurrentlyUpdating()) {
-    console.log("Skipping auto-refresh: an update is already in progress.");
-    return;
-  }
+  if (serverState.isCurrentlyUpdating()) return;
   
-  console.log(`[${format(getBeijingTime(), "HH:mm:ss")}] Starting automatic data refresh...`);
-  serverState.setUpdating(true);
+  const timestamp = format(getBeijingTime(), "HH:mm:ss");
+  console.log(`[${timestamp}] Starting data refresh...`);
+  serverState.startUpdate();
   
   try {
     const data = await getAggregatedData();
     serverState.updateCache(data);
-    console.log(`[${format(getBeijingTime(), "HH:mm:ss")}] Data cache updated successfully.`);
+    console.log(`[${timestamp}] Data updated successfully.`);
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error during auto-refresh';
-    console.error('Auto-refresh failed:', errorMessage);
-    serverState.setError(errorMessage);
-  } finally {
-    serverState.setUpdating(false);
+    serverState.setError(error instanceof Error ? error.message : 'Refresh failed');
   }
 }
 
@@ -1030,141 +962,69 @@ async function handleAddKeys(req: Request): Promise<Response> {
   }
 }
 
-/**
- * Handles batch import of multiple API keys.
- */
 async function handleBatchImport(items: unknown[]): Promise<Response> {
-  let added = 0;
-  let skipped = 0;
+  let added = 0, skipped = 0;
+  const existingKeys = new Set((await getAllKeys()).map(k => k.key));
 
   for (const item of items) {
-    // 简化验证：只需要key字段
-    if (!item || typeof item !== 'object' || !('key' in item)) {
-      continue;
-    }
-
+    if (!item || typeof item !== 'object' || !('key' in item)) continue;
+    
     const { key } = item as { key: string };
-
-    if (!key) {
+    if (!key || existingKeys.has(key)) {
+      if (key) skipped++;
       continue;
     }
 
-    // 检查API key是否已存在
-    if (await apiKeyExists(key)) {
-      skipped++;
-      continue;
-    }
-
-    // 自动生成唯一ID
     const id = `key-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     await addKey(id, key);
+    existingKeys.add(key);
     added++;
   }
 
-  // 触发数据刷新
-  if (added > 0) {
-    autoRefreshData();
-  }
+  if (added > 0) autoRefreshData();
 
-  return createJsonResponse({
-    success: true,
-    added,
-    skipped
-  });
+  return createJsonResponse({ success: true, added, skipped });
 }
 
-/**
- * Handles adding a single API key.
- */
 async function handleSingleKeyAdd(body: unknown): Promise<Response> {
-  // 简化验证：只需要key字段
   if (!body || typeof body !== 'object' || !('key' in body)) {
     return createErrorResponse("key is required", 400);
   }
 
   const { key } = body as { key: string };
+  if (!key) return createErrorResponse("key cannot be empty", 400);
+  if (await apiKeyExists(key)) return createErrorResponse("API key already exists", 409);
 
-  if (!key) {
-    return createErrorResponse("key cannot be empty", 400);
-  }
-
-  // 检查API key是否已存在
-  if (await apiKeyExists(key)) {
-    return createErrorResponse("API key already exists", 409);
-  }
-
-  // 自动生成唯一ID
   const id = `key-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
   await addKey(id, key);
-  
-  // 触发数据刷新
   autoRefreshData();
   
   return createJsonResponse({ success: true });
 }
 
-/**
- * Handles DELETE /api/keys/:id - deletes a specific API key.
- */
 async function handleDeleteKey(pathname: string): Promise<Response> {
-  try {
-    const id = pathname.split("/api/keys/")[1];
+  const id = pathname.split("/api/keys/")[1];
+  if (!id) return createErrorResponse("Key ID is required", 400);
 
-    if (!id) {
-      return createErrorResponse("Key ID is required", 400);
-    }
-
-    // 直接尝试删除，不先检查是否存在
-    await deleteKey(id);
-    
-    // 触发数据刷新
-    autoRefreshData();
-    
-    return createJsonResponse({ success: true });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('Error deleting key:', errorMessage);
-    return createErrorResponse("Key not found", 404);
-  }
+  await deleteKey(id);
+  autoRefreshData();
+  
+  return createJsonResponse({ success: true });
 }
 
-/**
- * Handles POST /api/keys/batch-delete - deletes multiple API keys at once.
- */
 async function handleBatchDeleteKeys(req: Request): Promise<Response> {
   try {
     const { ids } = await req.json() as { ids: string[] };
-
     if (!Array.isArray(ids) || ids.length === 0) {
       return createErrorResponse("ids array is required", 400);
     }
 
-    let deleted = 0;
+    await Promise.all(ids.map(id => deleteKey(id).catch(() => {})));
+    autoRefreshData();
 
-    // 并行删除所有键，提高性能
-    await Promise.all(ids.map(async (id) => {
-      try {
-        await deleteKey(id);
-        deleted++;
-      } catch (error) {
-        // 忽略删除失败的情况
-        console.error(`Failed to delete key ${id}:`, error);
-      }
-    }));
-    
-    // 触发数据刷新
-    if (deleted > 0) {
-      autoRefreshData();
-    }
-
-    return createJsonResponse({
-      success: true,
-      deleted
-    });
+    return createJsonResponse({ success: true, deleted: ids.length });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Invalid JSON';
-    console.error('Error batch deleting keys:', errorMessage);
-    return createErrorResponse(errorMessage, 400);
+    return createErrorResponse(error instanceof Error ? error.message : 'Invalid JSON', 400);
   }
 }
 
@@ -1191,6 +1051,40 @@ async function handleExportKeys(req: Request): Promise<Response> {
     const errorMessage = error instanceof Error ? error.message : 'Invalid JSON';
     console.error('Error exporting keys:', errorMessage);
     return createErrorResponse(errorMessage, 400);
+  }
+}
+
+/**
+ * Handles POST /api/keys/:id/refresh - refreshes data for a single API key.
+ */
+async function handleRefreshSingleKey(pathname: string): Promise<Response> {
+  try {
+    const id = pathname.split("/api/keys/")[1].replace("/refresh", "");
+
+    if (!id) {
+      return createErrorResponse("Key ID is required", 400);
+    }
+
+    // Get the key from database
+    const result = await kv.get<string>(["api_keys", id]);
+    
+    if (!result.value) {
+      return createErrorResponse("Key not found", 404);
+    }
+
+    const key = result.value;
+
+    // Fetch fresh data for this key
+    const keyData = await fetchApiKeyData(id, key);
+
+    return createJsonResponse({
+      success: true,
+      data: keyData
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('Error refreshing key:', errorMessage);
+    return createErrorResponse(errorMessage, 500);
   }
 }
 
@@ -1235,6 +1129,11 @@ async function handler(req: Request): Promise<Response> {
   // Route: DELETE /api/keys/:id - Delete a key
   if (url.pathname.startsWith("/api/keys/") && req.method === "DELETE") {
     return await handleDeleteKey(url.pathname);
+  }
+
+  // Route: POST /api/keys/:id/refresh - Refresh single key
+  if (url.pathname.match(/^\/api\/keys\/.+\/refresh$/) && req.method === "POST") {
+    return await handleRefreshSingleKey(url.pathname);
   }
 
   // 404 for all other routes
