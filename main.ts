@@ -293,11 +293,11 @@ const HTML_CONTENT = `
     </button>
 
     <button class="delete-all-btn" onclick="deleteAllKeys()" id="deleteAllBtn">
-        <span>🗑️ 删除所有Key</span>
+        <span>🗑️ 删除所有</span>
     </button>
 
     <button class="delete-zero-btn" onclick="deleteZeroBalanceKeys()" id="deleteZeroBtn">
-        <span>🗑️ 删除无效Key</span>
+        <span>🗑️ 删除无效</span>
     </button>
 
     <button class="refresh-btn" onclick="loadData()">
@@ -349,7 +349,7 @@ const HTML_CONTENT = `
         }  
   
   
-        function loadData() {  
+        function loadData(retryCount = 0) {  
             const spinner = document.getElementById('spinner');  
             const btnText = document.getElementById('btnText');  
                 
@@ -359,12 +359,20 @@ const HTML_CONTENT = `
   
             fetch('/api/data?t=' + new Date().getTime())  
                 .then(response => {  
+                    // If server is still initializing (503), auto-retry after 2 seconds
+                    if (response.status === 503 && retryCount < 5) {
+                        console.log(\`Server initializing, retrying in 2 seconds... (attempt \${retryCount + 1}/5)\`);
+                        document.getElementById('tableContent').innerHTML = \`<div class="loading">服务器正在初始化数据，请稍候... (尝试 \${retryCount + 1}/5)</div>\`;
+                        setTimeout(() => loadData(retryCount + 1), 2000);
+                        return null;
+                    }
                     if (!response.ok) {  
                         throw new Error('无法加载数据: ' + response.statusText);  
                     }  
                     return response.json();  
                 })  
-                .then(data => {  
+                .then(data => {
+                    if (data === null) return; // Skip if retrying
                     if (data.error) {  
                         throw new Error(data.error);  
                     }  
@@ -575,7 +583,7 @@ const HTML_CONTENT = `
                 alert('网络错误: ' + error.message);
             } finally {
                 deleteBtn.disabled = false;
-                deleteBtn.innerHTML = '<span>🗑️ 删除所有Key</span>';
+                deleteBtn.innerHTML = '<span>🗑️ 删除所有</span>';
             }
         }
 
@@ -626,7 +634,7 @@ const HTML_CONTENT = `
                 alert('网络错误: ' + error.message);
             } finally {
                 deleteBtn.disabled = false;
-                deleteBtn.innerHTML = '<span>🗑️ 删除0额度Key</span>';
+                deleteBtn.innerHTML = '<span>🗑️ 删除无效</span>';
             }
         }
 
@@ -728,10 +736,36 @@ const HTML_CONTENT = `
 // ==================== API Data Fetching ====================
 
 /**
- * Fetches usage data for a single API key.
+ * Batch process promises with concurrency control to avoid rate limiting.
  */
-async function fetchApiKeyData(id: string, key: string): Promise<ApiKeyResult> {
+async function batchProcess<T, R>(
+  items: T[],
+  processor: (item: T) => Promise<R>,
+  concurrency: number = 10,
+  delayMs: number = 100
+): Promise<R[]> {
+  const results: R[] = [];
+  
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(processor));
+    results.push(...batchResults);
+    
+    // Add delay between batches to avoid rate limiting
+    if (i + concurrency < items.length) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  
+  return results;
+}
+
+/**
+ * Fetches usage data for a single API key with retry logic.
+ */
+async function fetchApiKeyData(id: string, key: string, retryCount = 0): Promise<ApiKeyResult> {
   const maskedKey = maskApiKey(key);
+  const maxRetries = 2;
 
   try {
     const response = await fetch(CONFIG.API_ENDPOINT, {
@@ -743,6 +777,15 @@ async function fetchApiKeyData(id: string, key: string): Promise<ApiKeyResult> {
 
     if (!response.ok) {
       const errorBody = await response.text();
+      
+      // Retry on 429 (rate limit) or 503 (service unavailable)
+      if ((response.status === 429 || response.status === 401) && retryCount < maxRetries) {
+        const delayMs = (retryCount + 1) * 1000; // 1s, 2s
+        console.log(`Rate limited for key ${id}, retrying in ${delayMs}ms... (attempt ${retryCount + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        return fetchApiKeyData(id, key, retryCount + 1);
+      }
+      
       console.error(`Error fetching data for key ID ${id}: ${response.status} ${errorBody}`);
       return { id, key: maskedKey, error: `HTTP ${response.status}` };
     }
@@ -797,9 +840,13 @@ async function getAggregatedData(): Promise<AggregatedResponse> {
     throw new Error("数据库中没有找到 API Key。请通过管理界面添加 Key。");
   }
 
-  // Fetch all API key data in parallel
-  const results = await Promise.all(
-    keyPairs.map(({ id, key }) => fetchApiKeyData(id, key))
+  // Fetch API key data with concurrency control (10 at a time, 100ms delay between batches)
+  console.log(`Fetching data for ${keyPairs.length} API keys with rate limiting...`);
+  const results = await batchProcess(
+    keyPairs,
+    ({ id, key }) => fetchApiKeyData(id, key),
+    10, // Process 10 keys concurrently
+    100 // 100ms delay between batches
   );
 
   // Filter valid results (non-error)
@@ -931,9 +978,13 @@ async function handleGetData(): Promise<Response> {
     return createErrorResponse(lastError, 500);
   }
 
-  // If there's no data and no error, it means the initial fetch is still running.
-  // We can either wait or return a "loading" state. Here, we'll return a specific message.
-  return createErrorResponse("服务器正在初始化数据，请稍后刷新。", 503);
+  // If there's no data and no error, it means an update is in progress
+  if (serverState.isCurrentlyUpdating()) {
+    return createErrorResponse("数据正在更新中，请稍候...", 503);
+  }
+
+  // This shouldn't happen normally after initial load, but just in case
+  return createErrorResponse("暂无数据，请稍后刷新。", 503);
 }
 
 /**
@@ -1183,16 +1234,18 @@ async function handler(req: Request): Promise<Response> {
 
 // ==================== Server Initialization ====================
 
-function startServer() {
-  console.log(`Server running on http://localhost:${CONFIG.PORT}`);
+async function startServer() {
+  console.log("Initializing server...");
   
-  // Perform an initial data fetch on startup
+  // Perform an initial data fetch on startup and WAIT for it to complete
   console.log("Performing initial data fetch...");
-  autoRefreshData();
+  await autoRefreshData();
+  console.log("Initial data loaded successfully.");
   
   // Set up the interval for subsequent refreshes
   setInterval(autoRefreshData, CONFIG.AUTO_REFRESH_INTERVAL_SECONDS * 1000);
   
+  console.log(`Server running on http://localhost:${CONFIG.PORT}`);
   serve(handler, { port: CONFIG.PORT });
 }
 
