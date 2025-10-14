@@ -778,8 +778,7 @@ async function fetchApiKeyData(id: string, key: string, retryCount = 0): Promise
     if (!response.ok) {
       const errorBody = await response.text();
       
-      // Retry on 429 (rate limit) or 503 (service unavailable)
-      if ((response.status === 429 || response.status === 503) && retryCount < maxRetries) {
+      if (response.status === 401 && retryCount < maxRetries) {
         const delayMs = (retryCount + 1) * 1000; // 1s, 2s
         console.log(`Rate limited for key ${id}, retrying in ${delayMs}ms... (attempt ${retryCount + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
