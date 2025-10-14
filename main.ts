@@ -56,7 +56,6 @@ interface BatchImportResult {
   success: boolean;
   added: number;
   skipped: number;
-  errors?: string[];
 }
 
 // ==================== Configuration ====================
@@ -68,7 +67,45 @@ const CONFIG = {
   TIMEZONE_OFFSET_HOURS: 8, // Beijing time
   KEY_MASK_PREFIX_LENGTH: 4,
   KEY_MASK_SUFFIX_LENGTH: 4,
+  AUTO_REFRESH_INTERVAL_SECONDS: 60, // Set auto-refresh interval to 60 seconds
+  EXPORT_PASSWORD: Deno.env.get("EXPORT_PASSWORD") || "admin123", // Default password for key export
 } as const;
+
+// ==================== Server State and Caching (NEW) ====================
+
+class ServerState {
+  private cachedData: AggregatedResponse | null = null;
+  private lastError: string | null = null;
+  private isUpdating = false;
+
+  getData(): AggregatedResponse | null {
+    return this.cachedData;
+  }
+
+  getError(): string | null {
+    return this.lastError;
+  }
+
+  setUpdating(status: boolean) {
+    this.isUpdating = status;
+  }
+
+  isCurrentlyUpdating(): boolean {
+    return this.isUpdating;
+  }
+  
+  updateCache(data: AggregatedResponse) {
+    this.cachedData = data;
+    this.lastError = null; // Clear previous errors on successful update
+  }
+
+  setError(errorMessage: string) {
+    this.lastError = errorMessage;
+  }
+}
+
+const serverState = new ServerState();
+
 
 // ==================== Database Initialization ====================
 
@@ -96,6 +133,13 @@ async function deleteKey(id: string): Promise<void> {
   await kv.delete(["api_keys", id]);
 }
 
+// 检查API key是否已存在（基于key值而非id）
+async function apiKeyExists(key: string): Promise<boolean> {
+  const keys = await getAllKeys();
+  return keys.some(k => k.key === key);
+}
+
+// 检查ID是否存在（用于删除操作）
 async function keyExists(id: string): Promise<boolean> {
   const result = await kv.get(["api_keys", id]);
   return result.value !== null;
@@ -177,6 +221,14 @@ const HTML_CONTENT = `
         .delete-zero-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(220, 53, 69, 0.6); }
         .delete-zero-btn:active { transform: translateY(0); }
         .delete-zero-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .delete-all-btn { position: fixed; bottom: 160px; right: 30px; background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%); color: white; border: none; border-radius: 50px; padding: 15px 30px; font-size: 16px; cursor: pointer; box-shadow: 0 4px 15px rgba(255, 107, 107, 0.4); transition: all 0.3s ease; display: flex; align-items: center; gap: 8px; }
+        .delete-all-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(255, 107, 107, 0.6); }
+        .delete-all-btn:active { transform: translateY(0); }
+        .delete-all-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .export-keys-btn { position: fixed; bottom: 225px; right: 30px; background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; border: none; border-radius: 50px; padding: 15px 30px; font-size: 16px; cursor: pointer; box-shadow: 0 4px 15px rgba(40, 167, 69, 0.4); transition: all 0.3s ease; display: flex; align-items: center; gap: 8px; }
+        .export-keys-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(40, 167, 69, 0.6); }
+        .export-keys-btn:active { transform: translateY(0); }
+        .export-keys-btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .loading { text-align: center; padding: 40px; color: #6c757d; }
         .error { text-align: center; padding: 40px; color: #dc3545; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -236,8 +288,16 @@ const HTML_CONTENT = `
         </div>
     </div>
 
+    <button class="export-keys-btn" onclick="exportKeys()" id="exportKeysBtn">
+        <span>📥 导出Key</span>
+    </button>
+
+    <button class="delete-all-btn" onclick="deleteAllKeys()" id="deleteAllBtn">
+        <span>🗑️ 删除所有Key</span>
+    </button>
+
     <button class="delete-zero-btn" onclick="deleteZeroBalanceKeys()" id="deleteZeroBtn">
-        <span>🗑️ 删除0额度Key</span>
+        <span>🗑️ 删除无效Key</span>
     </button>
 
     <button class="refresh-btn" onclick="loadData()">
@@ -245,7 +305,6 @@ const HTML_CONTENT = `
         <span id="btnText">刷新数据</span>
     </button>
 
-    <!-- Key Management Modal -->
     <div id="manageModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
@@ -255,7 +314,6 @@ const HTML_CONTENT = `
             <div class="modal-body">
                 <div id="modalMessage"></div>
 
-                <!-- Batch Import -->
                 <form onsubmit="batchImportKeys(event)">
                     <div class="form-group">
                         <label>批量导入 Keys（每行一个 Key）</label>
@@ -394,17 +452,7 @@ const HTML_CONTENT = `
 
             tableHTML += \`
                     </tbody>
-                    <tfoot>
-                        <tr>
-                            <td colspan="3">总计 (SUM)</td>
-                            <td class="number">\${formatNumber(totalAllowance)}</td>
-                            <td class="number">\${formatNumber(totalUsed)}</td>
-                            <td class="number">\${formatNumber(totalRemaining)}</td>
-                            <td class="number">\${formatPercentage(overallRatio)}</td>
-                            <td></td>
-                        </tr>
-                    </tfoot>
-                </table>\`;  
+                </table>\`; 
   
   
             document.getElementById('tableContent').innerHTML = tableHTML;  
@@ -432,6 +480,103 @@ const HTML_CONTENT = `
 
         function clearMessage() {
             document.getElementById('modalMessage').innerHTML = '';
+        }
+
+        async function exportKeys() {
+            const password = prompt('请输入导出密码：');
+            if (!password) {
+                return;
+            }
+
+            const exportBtn = document.getElementById('exportKeysBtn');
+            exportBtn.disabled = true;
+            exportBtn.innerHTML = '<span>⏳ 导出中...</span>';
+
+            try {
+                const response = await fetch('/api/keys/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    // Create a text file with the keys (only key values, one per line)
+                    const keysText = result.keys.map(k => k.key).join('\\n');
+                    const blob = new Blob([keysText], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = \`api_keys_export_\${new Date().toISOString().split('T')[0]}.txt\`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    alert(\`成功导出 \${result.keys.length} 个Key\`);
+                } else {
+                    alert('导出失败: ' + (result.error || '未知错误'));
+                }
+            } catch (error) {
+                alert('网络错误: ' + error.message);
+            } finally {
+                exportBtn.disabled = false;
+                exportBtn.innerHTML = '<span>📥 导出Key</span>';
+            }
+        }
+
+        async function deleteAllKeys() {
+            if (!currentApiData) {
+                alert('请先加载数据');
+                return;
+            }
+
+            const totalKeys = currentApiData.total_count;
+
+            if (totalKeys === 0) {
+                alert('没有可删除的Key');
+                return;
+            }
+
+            const confirmMsg = \`⚠️ 危险操作！\\n\\n确定要删除所有 \${totalKeys} 个Key吗？\\n此操作不可恢复！\`;
+
+            if (!confirm(confirmMsg)) {
+                return;
+            }
+
+            // 二次确认
+            const secondConfirm = prompt('请输入 "确认删除" 以继续：');
+            if (secondConfirm !== '确认删除') {
+                alert('操作已取消');
+                return;
+            }
+
+            const deleteBtn = document.getElementById('deleteAllBtn');
+            deleteBtn.disabled = true;
+            deleteBtn.innerHTML = '<span>⏳ 删除中...</span>';
+
+            try {
+                const allIds = currentApiData.data.map(item => item.id);
+                const response = await fetch('/api/keys/batch-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids: allIds })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    alert(\`成功删除 \${result.deleted || totalKeys} 个Key\`);
+                    loadData(); // Refresh data
+                } else {
+                    alert('删除失败: ' + (result.error || '未知错误'));
+                }
+            } catch (error) {
+                alert('网络错误: ' + error.message);
+            } finally {
+                deleteBtn.disabled = false;
+                deleteBtn.innerHTML = '<span>🗑️ 删除所有Key</span>';
+            }
         }
 
         async function deleteZeroBalanceKeys() {
@@ -649,7 +794,7 @@ async function getAggregatedData(): Promise<AggregatedResponse> {
   const keyPairs = await getAllKeys();
 
   if (keyPairs.length === 0) {
-    throw new Error("No API keys found in database. Please add keys via the management interface.");
+    throw new Error("数据库中没有找到 API Key。请通过管理界面添加 Key。");
   }
 
   // Fetch all API key data in parallel
@@ -659,6 +804,20 @@ async function getAggregatedData(): Promise<AggregatedResponse> {
 
   // Filter valid results (non-error)
   const validResults = results.filter(isApiUsageData);
+
+  // Calculate remaining for each valid result
+  const resultsWithRemaining = validResults.map(result => ({
+    ...result,
+    remaining: Math.max(0, result.totalAllowance - result.orgTotalTokensUsed)
+  }));
+
+  // Sort by remaining balance in descending order (from highest to lowest)
+  resultsWithRemaining.sort((a, b) => b.remaining - a.remaining);
+
+  // Create the final results array with sorted valid results and error results
+  const sortedValidResults = resultsWithRemaining.map(({ remaining, ...rest }) => rest);
+  const errorResults = results.filter(isApiErrorData);
+  const finalResults = [...sortedValidResults, ...errorResults];
 
   // Calculate totals, ensuring totalRemaining is not negative
   const totals = validResults.reduce((acc, res) => {
@@ -685,7 +844,7 @@ async function getAggregatedData(): Promise<AggregatedResponse> {
     update_time: format(beijingTime, "yyyy-MM-dd HH:mm:ss"),
     total_count: keyPairs.length,
     totals,
-    data: results,
+    data: finalResults,
   };
 }
 
@@ -715,6 +874,35 @@ function logKeysWithBalance(validResults: ApiUsageData[], keyPairs: ApiKey[]): v
     console.log("\n⚠️  没有剩余额度大于0的API Keys\n");
   }
 }  
+
+
+// ==================== Auto-Refresh Logic (NEW) ====================
+
+/**
+ * Periodically fetches data and updates the server state cache.
+ */
+async function autoRefreshData() {
+  if (serverState.isCurrentlyUpdating()) {
+    console.log("Skipping auto-refresh: an update is already in progress.");
+    return;
+  }
+  
+  console.log(`[${format(getBeijingTime(), "HH:mm:ss")}] Starting automatic data refresh...`);
+  serverState.setUpdating(true);
+  
+  try {
+    const data = await getAggregatedData();
+    serverState.updateCache(data);
+    console.log(`[${format(getBeijingTime(), "HH:mm:ss")}] Data cache updated successfully.`);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error during auto-refresh';
+    console.error('Auto-refresh failed:', errorMessage);
+    serverState.setError(errorMessage);
+  } finally {
+    serverState.setUpdating(false);
+  }
+}
+
   
   
 // ==================== Route Handlers ====================
@@ -729,17 +917,23 @@ function handleRoot(): Response {
 }
 
 /**
- * Handles the /api/data endpoint - returns aggregated usage data.
+ * Handles the /api/data endpoint - returns cached aggregated usage data.
  */
 async function handleGetData(): Promise<Response> {
-  try {
-    const data = await getAggregatedData();
-    return createJsonResponse(data);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('Error fetching aggregated data:', errorMessage);
-    return createErrorResponse(errorMessage, 500);
+  const cachedData = serverState.getData();
+  
+  if (cachedData) {
+    return createJsonResponse(cachedData);
   }
+  
+  const lastError = serverState.getError();
+  if (lastError) {
+    return createErrorResponse(lastError, 500);
+  }
+
+  // If there's no data and no error, it means the initial fetch is still running.
+  // We can either wait or return a "loading" state. Here, we'll return a specific message.
+  return createErrorResponse("服务器正在初始化数据，请稍后刷新。", 503);
 }
 
 /**
@@ -782,61 +976,70 @@ async function handleAddKeys(req: Request): Promise<Response> {
 async function handleBatchImport(items: unknown[]): Promise<Response> {
   let added = 0;
   let skipped = 0;
-  const errors: string[] = [];
 
   for (const item of items) {
-    // Validate item structure
-    if (!item || typeof item !== 'object' || !('id' in item) || !('key' in item)) {
-      errors.push(`Invalid entry: missing id or key`);
+    // 简化验证：只需要key字段
+    if (!item || typeof item !== 'object' || !('key' in item)) {
       continue;
     }
 
-    const { id, key } = item as { id: string; key: string };
+    const { key } = item as { key: string };
 
-    if (!id || !key) {
-      errors.push(`Invalid entry: empty id or key`);
+    if (!key) {
       continue;
     }
 
-    if (await keyExists(id)) {
+    // 检查API key是否已存在
+    if (await apiKeyExists(key)) {
       skipped++;
       continue;
     }
 
+    // 自动生成唯一ID
+    const id = `key-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     await addKey(id, key);
     added++;
   }
 
-  const result: BatchImportResult = {
+  // 触发数据刷新
+  if (added > 0) {
+    autoRefreshData();
+  }
+
+  return createJsonResponse({
     success: true,
     added,
-    skipped,
-    errors: errors.length > 0 ? errors : undefined
-  };
-
-  return createJsonResponse(result);
+    skipped
+  });
 }
 
 /**
  * Handles adding a single API key.
  */
 async function handleSingleKeyAdd(body: unknown): Promise<Response> {
-  // Validate body structure
-  if (!body || typeof body !== 'object' || !('id' in body) || !('key' in body)) {
-    return createErrorResponse("id and key are required", 400);
+  // 简化验证：只需要key字段
+  if (!body || typeof body !== 'object' || !('key' in body)) {
+    return createErrorResponse("key is required", 400);
   }
 
-  const { id, key } = body as { id: string; key: string };
+  const { key } = body as { key: string };
 
-  if (!id || !key) {
-    return createErrorResponse("id and key cannot be empty", 400);
+  if (!key) {
+    return createErrorResponse("key cannot be empty", 400);
   }
 
-  if (await keyExists(id)) {
-    return createErrorResponse("Key ID already exists", 409);
+  // 检查API key是否已存在
+  if (await apiKeyExists(key)) {
+    return createErrorResponse("API key already exists", 409);
   }
 
+  // 自动生成唯一ID
+  const id = `key-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
   await addKey(id, key);
+  
+  // 触发数据刷新
+  autoRefreshData();
+  
   return createJsonResponse({ success: true });
 }
 
@@ -851,16 +1054,17 @@ async function handleDeleteKey(pathname: string): Promise<Response> {
       return createErrorResponse("Key ID is required", 400);
     }
 
-    if (!await keyExists(id)) {
-      return createErrorResponse("Key not found", 404);
-    }
-
+    // 直接尝试删除，不先检查是否存在
     await deleteKey(id);
+    
+    // 触发数据刷新
+    autoRefreshData();
+    
     return createJsonResponse({ success: true });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('Error deleting key:', errorMessage);
-    return createErrorResponse(errorMessage, 500);
+    return createErrorResponse("Key not found", 404);
   }
 }
 
@@ -869,56 +1073,63 @@ async function handleDeleteKey(pathname: string): Promise<Response> {
  */
 async function handleBatchDeleteKeys(req: Request): Promise<Response> {
   try {
-    const body = await req.json();
+    const { ids } = await req.json() as { ids: string[] };
 
-    // Validate body structure
-    if (!body || typeof body !== 'object' || !('ids' in body)) {
+    if (!Array.isArray(ids) || ids.length === 0) {
       return createErrorResponse("ids array is required", 400);
     }
 
-    const { ids } = body as { ids: unknown };
-
-    if (!Array.isArray(ids)) {
-      return createErrorResponse("ids must be an array", 400);
-    }
-
-    if (ids.length === 0) {
-      return createErrorResponse("ids array cannot be empty", 400);
-    }
-
     let deleted = 0;
-    let notFound = 0;
-    const errors: string[] = [];
 
-    for (const id of ids) {
-      if (typeof id !== 'string' || !id) {
-        errors.push(`Invalid ID: ${id}`);
-        continue;
-      }
-
-      if (!await keyExists(id)) {
-        notFound++;
-        continue;
-      }
-
+    // 并行删除所有键，提高性能
+    await Promise.all(ids.map(async (id) => {
       try {
         await deleteKey(id);
         deleted++;
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        errors.push(`Failed to delete ${id}: ${errorMessage}`);
+        // 忽略删除失败的情况
+        console.error(`Failed to delete key ${id}:`, error);
       }
+    }));
+    
+    // 触发数据刷新
+    if (deleted > 0) {
+      autoRefreshData();
     }
 
     return createJsonResponse({
       success: true,
-      deleted,
-      notFound,
-      errors: errors.length > 0 ? errors : undefined
+      deleted
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Invalid JSON';
     console.error('Error batch deleting keys:', errorMessage);
+    return createErrorResponse(errorMessage, 400);
+  }
+}
+
+/**
+ * Handles POST /api/keys/export - exports all API keys with password verification.
+ */
+async function handleExportKeys(req: Request): Promise<Response> {
+  try {
+    const { password } = await req.json() as { password: string };
+
+    // Verify password
+    if (password !== CONFIG.EXPORT_PASSWORD) {
+      return createErrorResponse("密码错误", 401);
+    }
+
+    // Get all keys (unmasked)
+    const keys = await getAllKeys();
+
+    return createJsonResponse({
+      success: true,
+      keys
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Invalid JSON';
+    console.error('Error exporting keys:', errorMessage);
     return createErrorResponse(errorMessage, 400);
   }
 }
@@ -956,6 +1167,11 @@ async function handler(req: Request): Promise<Response> {
     return await handleBatchDeleteKeys(req);
   }
 
+  // Route: POST /api/keys/export - Export keys with password
+  if (url.pathname === "/api/keys/export" && req.method === "POST") {
+    return await handleExportKeys(req);
+  }
+
   // Route: DELETE /api/keys/:id - Delete a key
   if (url.pathname.startsWith("/api/keys/") && req.method === "DELETE") {
     return await handleDeleteKey(url.pathname);
@@ -967,5 +1183,17 @@ async function handler(req: Request): Promise<Response> {
 
 // ==================== Server Initialization ====================
 
-console.log(`Server running on http://localhost:${CONFIG.PORT}`);
-serve(handler);
+function startServer() {
+  console.log(`Server running on http://localhost:${CONFIG.PORT}`);
+  
+  // Perform an initial data fetch on startup
+  console.log("Performing initial data fetch...");
+  autoRefreshData();
+  
+  // Set up the interval for subsequent refreshes
+  setInterval(autoRefreshData, CONFIG.AUTO_REFRESH_INTERVAL_SECONDS * 1000);
+  
+  serve(handler, { port: CONFIG.PORT });
+}
+
+startServer();
